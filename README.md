@@ -4,7 +4,7 @@
 
 ```c
 ctypesgen --output-language=json /usr/include/some.h > some.json
-ctypesgen_to_pxd < some.h > some.pxd
+ctypesgen_to_pxd < some.json > some.pxd
 
 vim use_some.pxy
 

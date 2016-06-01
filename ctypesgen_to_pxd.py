@@ -479,7 +479,7 @@ def convert(f_in, f_out, import_from='*', indent_level=0):
     if hasattr(f_in, 'read'):
         definition = load(f_in)
     else:
-        definition = fin
+        definition = f_in
 
     for definition in definition:
         if not isinstance(definition, dict):
