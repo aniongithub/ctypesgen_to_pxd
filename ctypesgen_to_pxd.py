@@ -29,7 +29,7 @@ __license__ = 'Apache License, Version 2.0'
 __version__ = '0.0.1'
 __maintainer__ = 'René Kijewski'
 __email__ = 'rene.SURNAME@fu-berlin.de'
-__status__ = 'Production'
+__status__ = 'Prototype'
 
 
 __all__ = ('convert',)
