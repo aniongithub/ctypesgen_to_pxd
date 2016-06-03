@@ -17,11 +17,13 @@
 
 
 from argparse import ArgumentParser, FileType
+from base64 import b32encode
 from builtins import compile as compile_expr
+from hashlib import md5
 from inspect import stack, getframeinfo
 from io import StringIO
 from json import loads
-from logging import getLogger, basicConfig, WARN
+from logging import getLogger, basicConfig, WARN, ERROR
 from os.path import basename, splitext
 from regex import compile as compile_re, VERBOSE, VERSION1
 from subprocess import Popen, PIPE, TimeoutExpired
@@ -52,6 +54,11 @@ def _anon_struct_name(variety, tag):
     return tag
 
 
+def _anon_array_name(definition):
+    hashsum = md5(definition.encode('UTF-8')).digest()
+    return '_arr' + b32encode(hashsum).rstrip(b'=').decode('ASCII')
+
+
 def _stdint_gen():
     for prefix in ('', 'u'):
         for infix in ('', '_least', '_fast'):
@@ -66,7 +73,7 @@ _STDDEF_TYPES = sorted('ptrdiff_t size_t wchar_t'.split())
 _STDINT_TYPES = sorted(_stdint_gen())
 
 _SIMPLE_TYPES = frozenset('''
-    int char short void size_t ssize_t float double
+    int char short void size_t ssize_t float double _Bool
 '''.split()) | set(_STDDEF_TYPES + _STDINT_TYPES)
 
 _match_verbatim = compile_re(r'''
@@ -215,12 +222,13 @@ def _convert_constant(f_out, indent_level, definition):
         _put(f_out, indent_level + 1, name, ' = ', _anon_enum_name, '.', name)
         return True
 
-    const_args = _format_constant(f_out, indent_level, value)
-    if not const_args:
-        return const_args
+    _put(f_out, indent_level, 'cdef enum:  # was a constant: ', repr(value))
 
-    _put(f_out, indent_level, 'cdef enum:  # was a constant')
-    _put(f_out, indent_level + 1, name, ' = (', *const_args, ')')
+    const_args = _format_constant(f_out, indent_level, value)
+    if const_args:
+        _put(f_out, indent_level + 1, name, ' = (', *const_args, ')')
+    else:
+        _put(f_out, indent_level + 1, name, '  # value could not be parsed')
     return True
 
 
@@ -524,12 +532,13 @@ def _convert_macro(f_out, indent_level, definition):
         _logger.info('Macro omitted: %s', name)
         return False  # sic
 
-    const_args = _format_constant(f_out, indent_level, value)
-    if not const_args:
-        return const_args
-
     _put(f_out, indent_level, 'cdef enum:  # was a macro: %r' % value)
-    _put(f_out, indent_level + 1, name, ' = (', *const_args, ')')
+
+    const_args = _format_constant(f_out, indent_level, value)
+    if const_args:
+        _put(f_out, indent_level + 1, name, ' = (', *const_args, ')')
+    else:
+        _put(f_out, indent_level + 1, name, '  # value could not be parsed')
     return True
 
 
@@ -567,11 +576,48 @@ def _convert_struct(f_out, indent_level, definition, struct='struct'):
     if fields is None:
         _put(f_out, indent_level,
              'cdef ', struct, ' ', *name_args, '  # forward declaration')
-    else:
-        _put(f_out, indent_level, 'cdef ', struct, ' ', *name_args, ':')
-        for field in fields:
-            _convert_typedef(f_out, indent_level + 1, field,
-                             include_cdef=False)
+        return True
+
+    fields_args = []
+    for field_i, field in enumerate(fields):
+        name = field.get('name') or ('__member_%d' % field_i)
+
+        ctype = field.get('ctype')
+        if not isinstance(ctype, dict):
+            _logger.error('Unknown typedef data type(ctype)=%r', type(ctype))
+            return False
+
+        klass = ctype.get('Klass')
+        if klass != 'CtypesArray':
+            convert_fun = _CONVERT_TYPEDEF_FUNS.get(klass)
+            if not convert_fun:
+                _warn(f_out, indent_level, 'Unknown typedef Klass=%r', klass)
+                return False
+
+            field_args = convert_fun(f_out, indent_level, name, ctype,
+                                     include_cdef=False)
+            if not field_args:
+                return field_args
+
+        else:  # klass == 'CtypesArray'
+            array_args = _format_CtypesArray(f_out, indent_level, ctype)
+            if not array_args:
+                return array_args
+            base_args, count_args = array_args
+
+            actual_def = ('__typeof__(', *base_args, '[', *count_args, '])')
+            actual_def = repr(''.join(map(str, actual_def)))
+            anon = _anon_array_name(actual_def)
+            _put(f_out, indent_level, 'ctypedef ', *base_args, '[1] ',
+                 anon, ' ', actual_def)
+
+            field_args = anon, ' ', name
+
+        fields_args.append(field_args)
+
+    _put(f_out, indent_level, 'cdef ', struct, ' ', *name_args, ':')
+    for field_args in fields_args:
+        _put(f_out, indent_level + 1, *field_args)
 
     return True
 
@@ -894,6 +940,9 @@ def convert(definitions, f_out, *,
                 _put(f_out, indent_level + 1, line)
             _put(f_out, indent_level, ')')
 
+        _put(f_out, indent_level, 'cdef extern from *:')
+        _put(f_out, indent_level + 1, 'ctypedef bint _Bool')
+
         _put(f_out, indent_level)
         _put(f_out, indent_level)
 
@@ -996,17 +1045,20 @@ def gen_argv_parser(prog):
                         const=True,
                         dest='no_includes',
                         help='Don\'t import standard types like int32_t.')
+    parser.add_argument('-W', '--no-warnings',
+                        action='store_const',
+                        default=WARN,
+                        const=ERROR,
+                        dest='log_level',
+                        help='Don\'t show warnings.')
     return parser
 
 
 def main(argv=argv, stdin=stdin, stdout=stdout):
-    basicConfig(
-        level=WARN,
-        format='[%(levelname)s] %(message)s',
-    )
-
     parser = gen_argv_parser(argv[0])
     args = parser.parse_args(argv[1:])
+
+    basicConfig(level=args.log_level, format='[%(levelname)s] %(message)s')
 
     if not args.input or args.input == '-':
         args.input = None

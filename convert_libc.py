@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 
-from os import makedirs
+from os import open, O_RDWR, makedirs, devnull
 from os.path import abspath, exists, isfile, isdir, dirname
-from subprocess import check_call
+from subprocess import check_call, check_output, STDOUT
+from re import compile as compile_re, M
 from sys import argv, stderr
 
 
@@ -95,20 +96,47 @@ _HEADERS = '''
 '''.split()
 
 
-def main(dest_dir='./converted_headers', *args,
+_include_pattern = compile_re(r'^ (/usr/[+\-./0-9@A-Z_a-z]+)$', M)
+
+_null_fd = open(devnull, O_RDWR)
+
+
+def main(dest_base='./converted_headers', *args,
          root=dirname(abspath(__file__))):
+    cc1plus = check_output(
+        ('gcc', '-print-prog-name=cc1plus'),
+        stdin=_null_fd,
+        stderr=_null_fd,
+    ).decode('UTF-8', 'ignore').split('\n',1)[0]
+
+    includepaths = _include_pattern.findall(check_output(
+        (cc1plus, '-v'),
+        stdin=_null_fd,
+        stderr=STDOUT,
+    ).decode('UTF-8', 'ignore').split('\n\n',1)[0])
+
     for header in _HEADERS:
-        src_path = '/usr/include/%s.h' % header
-        if not exists(src_path) or not isfile(src_path):
+        src_paths = [
+            abspath('%s/%s.h' % (includepath, header))
+            for includepath in includepaths
+        ]
+        for src_path in src_paths:
+            if exists(src_path) and isfile(src_path):
+                break
+        else:
+            print('\nHeader does not exists: ' + header + '. Searched in:',
+                  *src_paths, file=stderr, sep='\n')
             continue
 
-        dest_path = '%s/%s.pxd' % (dest_dir, header)
+        dest_path = abspath('%s/%s.pxd' % (dest_base, header))
         if exists(dest_path):
+            print('\nAlready converted:', dest_path, file=stderr)
             continue
 
         dest_dir = dirname(dest_path)
         if not exists(dest_dir):
             makedirs(dest_dir)
+            check_call(('touch', dest_dir + '/__init__.pxd'))
         elif not isdir(dest_dir):
             continue
 
