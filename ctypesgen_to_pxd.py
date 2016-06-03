@@ -66,132 +66,116 @@ _STDDEF_TYPES = sorted('ptrdiff_t size_t wchar_t'.split())
 _STDINT_TYPES = sorted(_stdint_gen())
 
 _SIMPLE_TYPES = frozenset('''
-    int char short void size_t float double
+    int char short void size_t ssize_t float double
 '''.split()) | set(_STDDEF_TYPES + _STDINT_TYPES)
 
 _match_verbatim = compile_re(r'''
-    \A
-    (?P<whole>
-        \s*+
+    # unary plus / minus
+    (?>
+        [+~-\s]+ |
+        sizeof (?=\W)
+    )*+
+
+    (?>
+        # match integer
+        (?: 0x)?+
+        \d++
+        [uU]? [lL]{0,2}
+    |
+        # match float
+        \d++ (?> [.] \d++)? (?> [eE] [+-]?+ \d++)?+
+    |
+        # match identifier
+        [_a-zA-Z] [_a-zA-Z0-9]*+
+    |
+        # match string
+        ["]
         (?>
-            # unary plus / minus
-            [+-]
-            \s*+
+            [^"\\\r\n]++ |
+            [\\] (?>
+                [abefnrtv\\'"?] |
+                [1-2][0-7]{0,2} |
+                [3-7][0-7]? |
+                x[0-9a-fA-F]{2}
+            )
         )*+
-
-        (?>
-            (?>
-                # match integer
-                (?: 0x)?+
-                \d++
-                [uU]? [lL]{0,2}
-            )
-        |
-            (?>
-                # match float
-                \d++ (?> [.] \d++)? (?> [eE] [+-]?+ \d++)?+
-            )
-        |
-            (?>
-                # match identifier
-                [_a-zA-Z] [_a-zA-Z0-9]*+
-            )
-        |
-            (?>
-                # match string
-                ["]
-                (?>
-                    [^"\\\r\n] |
-                    [\\] (?>
-                        [abefnrtv\\'"?] |
-                        [1-2][0-7]{0,2} |
-                        [3-7][0-7]? |
-                        x[0-9a-fA-F]{2}
-                    )
-                )*+
-                ["]
-            )
-        |
-            (?>
-                # match parens
-                \( (?&whole) \)
-            )
-        )
-        \s*+
-
-        (?>
-            # match calculation
-            (?> [+*/%^|-] | << | >>)
-            (?1)
-        )?+
+        ["]
+    |
+        # match parens
+        \( (?R) \)
     )
-    \Z
-''', VERBOSE | VERSION1).match
+
+    \s*+
+
+    (?>
+        # match calculation
+        (?> [+*/%&^|-] | << | >>)
+        (?R)
+    )?+
+''', VERBOSE | VERSION1).fullmatch
 
 _match_repr_str = compile_re(r'''
-    \A
-        (['"])
+    (['"])
+    (?>
+        (?! \1)
         (?>
-            (?! \1)
-            (?>
-                [^\\\r\n] |
-                [\\] (?>
-                    [0abefnrtv\\'"?] |
-                    [1-2][0-7]{0,2} |
-                    [3-7][0-7]? |
-                    x[0-9a-fA-F]{2} |
-                    u[0-9a-fA-F]{4} |
-                    U[0-9a-fA-F]{8}
-                )
+            [^\\\r\n] |  # cannot add ++ because the (?!\1) is needed
+            [\\] (?>
+                [0abefnrtv\\'"?] |
+                [1-2][0-7]{0,2} |
+                [3-7][0-7]? |
+                x[0-9a-fA-F]{2} |
+                u[0-9a-fA-F]{4} |
+                U[0-9a-fA-F]{8}
             )
-        )*+
-        \1
-    \Z
-''', VERBOSE | VERSION1).match
+        )
+    )*+
+    \1
+''', VERBOSE | VERSION1).fullmatch
 
 _match_int = compile_re(r'''
-    \A(?P<whole>
-        \s*+
+    \s*+
+    (?>
+        \( (?R) \)
+    |
         (?>
-            \( (?&whole) \)
-            |
             (?>
+                (?> (?P<minus> -) | [+] )
+                \s*+
+            )?
+            (?P<inner>
+                \( \s*+ (?&inner) \s*+ \)
+            |
                 (?>
-                    (?> (?P<minus> -) | [+] )
-                    \s*+
-                )?
-                (?P<inner>
-                    \( \s*+ (?&inner) \s*+ \)
-                    |
-                    (?>
-                        (?P<prefix> 0x?)?
-                        (?P<digits> \d+)
-                        (?> [uU]? [lL]{0,2})
-                    )
+                    (?P<prefix> 0x?)?
+                    (?P<digits> \d+)
+                    (?> [uU]? [lL]{0,2})
                 )
             )
         )
-        \s*+
-    )\Z
-''', VERBOSE | VERSION1).match
+    )
+    \s*+
+''', VERBOSE | VERSION1).fullmatch
 
 _match_identifier = compile_re(r'''
-    \A(?P<whole>
-        \s*+
-        (?>
-            \( (?&whole) \)
-            |
-            (?P<value> [_a-zA-Z] [_a-zA-Z0-9]*+ )
-        )
-        \s*+
-    )\Z
-''', VERBOSE | VERSION1).match
+    \s*+
+    (?>
+        \( (?R) \)
+    |
+        (?P<value> [_a-zA-Z] [_a-zA-Z0-9]*+ )
+    )
+    \s*+
+''', VERBOSE | VERSION1).fullmatch
 
 _BinaryExpressionNode_Ops = {
     'addition': '+',
-    'less-than': '<',
+    'bitwise or': '|',
+    'division': '/',
     'left shift': '<<',
+    'less-than': '<',
+    'multiplication': '*',
     'right shift': '>>',
+    'subtraction': '-',
 }
 
 _UnaryExpressionNode_Ops = {
@@ -210,9 +194,9 @@ def _format_CtypesSimple(f_out, indent_level, ctype):
                       'signed ' if name in ('int', 'short') else
                       '')
         return (signedness, 'long ' * longs, name)
-    else:
-        _warn(f_out, indent_level, 'Unknown CtypesSimple name=%r', name)
-        return False
+
+    _warn(f_out, indent_level, 'Unknown CtypesSimple name=%r', name)
+    return False
 
 
 def _convert_constant(f_out, indent_level, definition):
@@ -306,6 +290,20 @@ def _format_rhs_IdentifierExpressionNode(f_out, indent_level, definition):
     return name,
 
 
+def _format_rhs_SizeOfExpressionNode(f_out, indent_level, definition):
+    child = definition.get('child')
+    if not isinstance(child, dict):
+        _logger.error('Unknown SizeOfExpressionNode type(child)=%r',
+                      type(child))
+        return False
+
+    child_args = _convert_base_Klass(f_out, indent_level, child)
+    if not child_args:
+        return child_args
+
+    return ('(sizeof(', *child_args, '))')
+
+
 def _format_rhs_ConditionalExpressionNode(f_out, indent_level, definition):
     cond = definition.get('cond')
     no = definition.get('no')
@@ -352,12 +350,13 @@ def _format_rhs_TypeCastExpressionNode(f_out, indent_level, definition):
 
 
 _FORMAT_RHS_FUNS = {
-    'ConstantExpressionNode': _format_rhs_ConstantExpressionNode,
     'BinaryExpressionNode': _format_rhs_BinaryExpressionNode,
-    'UnaryExpressionNode': _format_rhs_UnaryExpressionNode,
-    'IdentifierExpressionNode': _format_rhs_IdentifierExpressionNode,
     'ConditionalExpressionNode': _format_rhs_ConditionalExpressionNode,
+    'ConstantExpressionNode': _format_rhs_ConstantExpressionNode,
+    'IdentifierExpressionNode': _format_rhs_IdentifierExpressionNode,
+    'SizeOfExpressionNode': _format_rhs_SizeOfExpressionNode,
     'TypeCastExpressionNode': _format_rhs_TypeCastExpressionNode,
+    'UnaryExpressionNode': _format_rhs_UnaryExpressionNode,
 }
 
 
@@ -534,6 +533,25 @@ def _convert_macro(f_out, indent_level, definition):
     return True
 
 
+def _convert_variable(f_out, indent_level, definition):
+    name = definition.get('name')
+    if not name:
+        _logger.error('Unknown variable name=%r', name)
+        return False
+
+    ctype = definition.get('ctype')
+    if not isinstance(ctype, dict):
+        _logger.error('Unknown variable type(ctype)=%r', type(ctype))
+        return False
+
+    type_args = _convert_base_Klass(f_out, indent_level, ctype)
+    if not type_args:
+        return type_args
+
+    _put(f_out, indent_level, 'cdef extern ', *type_args, ' ', name)
+    return True
+
+
 def _convert_struct(f_out, indent_level, definition, struct='struct'):
     name = definition.get('name')
     fields = definition.get('fields')
@@ -582,6 +600,27 @@ def _convert_typedef_CtypesEnum(f_out, indent_level,
         return False
 
     return ('ctypedef ' if include_cdef else '', tag, ' ', name or '')
+
+
+def _convert_typedef_CtypesBitfield(f_out, indent_level,
+                                    name, ctype, include_cdef):
+    base = ctype.get('base')
+    if not isinstance(base, dict):
+        _logger.error('Unknown CtypesBitfield type(base)=%r', type(base))
+        return False
+
+    klass = base.get('Klass')
+    if not klass:
+        _logger.error('Unknown CtypesBitfield Klass=%r', klass)
+        return False
+
+    convert_fun = _CONVERT_TYPEDEF_FUNS.get(klass)
+    if convert_fun:
+        _warn(f_out, indent_level, 'Bitfield specification ignored in .pxd')
+        return convert_fun(f_out, indent_level, name, base, include_cdef)
+
+    _warn(f_out, indent_level, 'Unsupported CtypesBitfield Klass=%r', klass)
+    return False
 
 
 def _convert_typedef_CtypesStruct(f_out, indent_level,
@@ -843,24 +882,25 @@ def _warn(f_out, indent_level, warn_format, *args):
 
 
 def convert(definitions, f_out, *,
-            import_from='*', indent_level=0, def_extras=()):
+            import_from='*', indent_level=0, def_extras=(),
+            include_std_types=True):
     global _last_anon_enum
 
-    unknown_types = set()
+    if include_std_types:
+        for h_name, items in (('stddef', _STDDEF_TYPES),
+                              ('stdint', _STDINT_TYPES)):
+            _put(f_out, indent_level, 'from libc.', h_name, ' cimport (')
+            for line in wrap(', '.join(items), 79 - 4 * (indent_level + 1)):
+                _put(f_out, indent_level + 1, line)
+            _put(f_out, indent_level, ')')
 
-    for h_name, items in (('stddef', _STDDEF_TYPES),
-                          ('stdint', _STDINT_TYPES)):
-        _put(f_out, indent_level, 'from libc.', h_name, ' cimport (')
-        for line in wrap(', '.join(items), 79 - 4 * (indent_level + 1)):
-            _put(f_out, indent_level + 1, line)
-        _put(f_out, indent_level, ')')
-
-    _put(f_out, indent_level)
-    _put(f_out, indent_level)
+        _put(f_out, indent_level)
+        _put(f_out, indent_level)
 
     _put(f_out, indent_level,
          'cdef extern from ', import_from or '*', *def_extras, ':')
 
+    unknown_types = set()
     for definition in definitions:
         if not isinstance(definition, dict):
             continue
@@ -950,6 +990,12 @@ def gen_argv_parser(prog):
                         const=True,
                         dest='quiet_ctypesgen',
                         help='Suppress ctypesgen warnings.')
+    parser.add_argument('--no-includes',
+                        action='store_const',
+                        default=False,
+                        const=True,
+                        dest='no_includes',
+                        help='Don\'t import standard types like int32_t.')
     return parser
 
 
@@ -1033,7 +1079,8 @@ def main(argv=argv, stdin=stdin, stdout=stdout):
         convert(definitions, f_out,
                 import_from=args.import_from,
                 indent_level=args.indent_level,
-                def_extras=(args.use_gil,))
+                def_extras=(args.use_gil,),
+                include_std_types=not args.no_includes)
 
 
 _CONVERT_BASE_FUNS = {
@@ -1048,6 +1095,7 @@ _CONVERT_BASE_FUNS = {
 
 _CONVERT_TYPEDEF_FUNS = {
     'CtypesArray': _convert_typedef_CtypesArray,
+    'CtypesBitfield': _convert_typedef_CtypesBitfield,
     'CtypesEnum': _convert_typedef_CtypesEnum,
     'CtypesFunction': _convert_typedef_CtypesFunction,
     'CtypesPointer': _convert_typedef_CtypesPointer,
@@ -1066,6 +1114,7 @@ _CONVERT_FUNS = {
     'struct': _convert_struct,
     'typedef': _convert_typedef,
     'union': _convert_union,
+    'variable': _convert_variable,
 }
 
 
