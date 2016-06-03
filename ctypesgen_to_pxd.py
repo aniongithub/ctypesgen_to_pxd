@@ -17,10 +17,13 @@
 
 
 from argparse import ArgumentParser, FileType
+from builtins import compile as compile_expr
+from inspect import stack, getframeinfo
+from io import StringIO
 from json import loads
 from logging import getLogger, basicConfig, WARN
 from os.path import basename, splitext
-from regex import compile, VERBOSE, VERSION1
+from regex import compile as compile_re, VERBOSE, VERSION1
 from subprocess import Popen, PIPE, TimeoutExpired
 from sys import stdin, stdout, stderr, argv
 from textwrap import wrap
@@ -41,6 +44,8 @@ __all__ = ('convert',)
 _logger = getLogger('ctypesgen_to_pxd')
 
 NoneType = type(None)
+
+automatic_import_from = object()
 
 
 def _anon_struct_name(variety, tag):
@@ -64,177 +69,9 @@ _SIMPLE_TYPES = frozenset('''
     int char short void size_t float double
 '''.split()) | set(_STDDEF_TYPES + _STDINT_TYPES)
 
-
-def _format_CtypesSimple(ctype):
-    name = ctype.get('name')
-    if name in _SIMPLE_TYPES:
-        signed = ctype.get('signed')
-        longs = ctype.get('longs') or 0
-        return (
-            'unsigned ' if not signed else 'signed ' if name == 'int' else '',
-            'long ' * longs,
-            name
-        )
-    else:
-        _logger.warn('Unknown CtypesSimple name=%r', name)
-        return False
-
-
-def _convert_constant(definition, f_out, indent_level):
-    name = definition.get('name')
-    value = definition.get('value')
-
-    if not name or not value:
-        _logger.warn('Unknown constant name=%r value=%r', name, value)
-        return False
-
-    _put(f_out, indent_level, 'cdef enum:  # was a constant')
-    _put(f_out, indent_level + 1, name, ' = (', value, ')')
-    return True
-
-
-def _format_rhs(definition):
-    klass = definition.get('Klass')
-
-    if klass == 'ConstantExpressionNode':
-        value = definition.get('value')
-        if value is not None:
-            return value,
-
-    elif klass == 'BinaryExpressionNode':
-        left = definition.get('left')
-        right = definition.get('right')
-
-        if not all(isinstance(i, dict) for i in (left, right)):
-            _logger.error('Unknown BinaryExpressionNode type(left)=%r '
-                          'type(right)=%r', type(left), type(right))
-            return False
-
-        name = definition.get('name')
-        if name == 'addition':
-            left_args = _format_rhs(left)
-            if not left_args:
-                return left_args
-
-            right_args = _format_rhs(right)
-            if not right_args:
-                return right_args
-
-            return ('((', *left_args, ') + (', *right_args, '))')
-
-    elif klass == 'IdentifierExpressionNode':
-        name = definition.get('name')
-        if not name:
-            _logger.error('Unknown IdentifierExpressionNode name=%r', name)
-
-        return name,
-
-    _logger.warn('Unsupported rhs Klass=%r', klass)
-    return False
-
-
-def _convert_enum(definition, f_out, indent_level):
-    name = definition.get('name')
-    fields = definition.get('fields')
-
-    if not name or not isinstance(fields, (list, NoneType)):
-        _logger.error('Unknown enum name=%r type(fields)=%r',
-                      name, type(fields))
-        return False
-
-    printed = None
-    if fields:
-        for field in fields:
-            field_name = field.get('name')
-            if not field_name:
-                _logger.error('Unknown enum field name=%r', field_name)
-                continue
-
-            ctype = field.get('ctype')
-            if not isinstance(ctype, dict):
-                _logger.error('Unknown enum field ctype=%r', ctype)
-                continue
-
-            value_args = _format_rhs(ctype)
-            if not value_args:
-                continue
-
-            if not printed:
-                _put(f_out, indent_level, 'cdef enum ', name or '', ':')
-                printed = True
-
-            _put(f_out, indent_level + 1, field_name, ' = (', *value_args, ')')
-
-    return printed
-
-
-def _format_function(definition):
-    _absent = object()
-
-    variadic = definition.get('variadic')
-
-    returns = definition.get('return', _absent)
-    if returns is _absent:
-        returns = definition.get('restype')
-
-    args = definition.get('args', _absent)
-    if args is _absent:
-        args = definition.get('argtypes')
-
-    if not isinstance(returns, (dict, NoneType)):
-        _logger.error('Unknown fuction type(return)=%r', type(returns))
-        return False
-    elif not isinstance(args, (list, NoneType)):
-        _logger.error('Unknown fuction type(args)=%r', type(returns))
-        return False
-
-    if returns:
-        returns_args = _convert_base_Klass(returns)
-        if not returns_args:
-            return returns_args
-    else:
-        returns_args = 'void',
-
-    args_args = ()
-    if args:
-        for i in args:
-            i_args = _convert_base_Klass(i)
-            if not i_args:
-                return i_args
-            elif args_args:
-                args_args = (*args_args, ', ', *i_args)
-            else:
-                args_args = i_args
-
-    if variadic:
-        if args_args:
-            args_args = (*args_args, ', ...')
-        else:
-            args_args = ('...',)
-
-    return returns_args, args_args
-
-
-def _convert_function(definition, f_out, indent_level):
-    name = definition.get('name')
-    if not name:
-        _logger.error('Unknown fuction name=%r', name)
-        return False
-
-    args = _format_function(definition)
-    if not args:
-        return args
-
-    returns_args, args_args = args
-
-    _put(f_out, indent_level,
-         'cdef ', *returns_args, ' ', name, '(', *args_args, ')')
-    return True
-
-
-_match_verbatim = compile(r'''
+_match_verbatim = compile_re(r'''
     \A
-    (
+    (?P<whole>
         \s*+
         (?>
             # unary plus / minus
@@ -244,19 +81,15 @@ _match_verbatim = compile(r'''
 
         (?>
             (?>
-                #match integer or float
+                # match integer
                 (?: 0x)?+
                 \d++
-                (?>
-                    [lL]
-                |
-                    (?> [.] \d++)?+ (?> [eE] [+-]?+ \d++)?+
-                )?+
+                [uU]? [lL]{0,2}
             )
         |
             (?>
-                # match float without leading zero
-                [.] \d++ (?> [eE] [+-]?+ \d++)?+
+                # match float
+                \d++ (?> [.] \d++)? (?> [eE] [+-]?+ \d++)?+
             )
         |
             (?>
@@ -265,22 +98,58 @@ _match_verbatim = compile(r'''
             )
         |
             (?>
+                # match string
+                ["]
+                (?>
+                    [^"\\\r\n] |
+                    [\\] (?>
+                        [abefnrtv\\'"?] |
+                        [1-2][0-7]{0,2} |
+                        [3-7][0-7]? |
+                        x[0-9a-fA-F]{2}
+                    )
+                )*+
+                ["]
+            )
+        |
+            (?>
                 # match parens
-                \( (?1) \)
+                \( (?&whole) \)
             )
         )
         \s*+
 
         (?>
             # match calculation
-            [+\-*\/%] (?1)
+            (?> [+*/%^|-] | << | >>)
+            (?1)
         )?+
     )
     \Z
 ''', VERBOSE | VERSION1).match
 
+_match_repr_str = compile_re(r'''
+    \A
+        (['"])
+        (?>
+            (?! \1)
+            (?>
+                [^\\\r\n] |
+                [\\] (?>
+                    [0abefnrtv\\'"?] |
+                    [1-2][0-7]{0,2} |
+                    [3-7][0-7]? |
+                    x[0-9a-fA-F]{2} |
+                    u[0-9a-fA-F]{4} |
+                    U[0-9a-fA-F]{8}
+                )
+            )
+        )*+
+        \1
+    \Z
+''', VERBOSE | VERSION1).match
 
-_match_int = compile(r'''
+_match_int = compile_re(r'''
     \A(?P<whole>
         \s*+
         (?>
@@ -306,7 +175,7 @@ _match_int = compile(r'''
     )\Z
 ''', VERBOSE | VERSION1).match
 
-_match_identifier = compile(r'''
+_match_identifier = compile_re(r'''
     \A(?P<whole>
         \s*+
         (?>
@@ -318,8 +187,337 @@ _match_identifier = compile(r'''
     )\Z
 ''', VERBOSE | VERSION1).match
 
+_BinaryExpressionNode_Ops = {
+    'addition': '+',
+    'less-than': '<',
+    'left shift': '<<',
+    'right shift': '>>',
+}
 
-def _convert_macro(definition, f_out, indent_level):
+_UnaryExpressionNode_Ops = {
+    'negation': '-',
+}
+
+_last_anon_enum = None, None  # FIXME: eliminate global variable
+
+
+def _format_CtypesSimple(f_out, indent_level, ctype):
+    name = ctype.get('name')
+    if name in _SIMPLE_TYPES:
+        signed = ctype.get('signed')
+        longs = ctype.get('longs') or 0
+        signedness = ('unsigned ' if not signed else
+                      'signed ' if name in ('int', 'short') else
+                      '')
+        return (signedness, 'long ' * longs, name)
+    else:
+        _warn(f_out, indent_level, 'Unknown CtypesSimple name=%r', name)
+        return False
+
+
+def _convert_constant(f_out, indent_level, definition):
+    name = definition.get('name')
+    value = definition.get('value')
+
+    if not name or not value:
+        _warn(f_out, indent_level,
+              'Unknown constant name=%r value=%r', name, value)
+        return False
+
+    _anon_enum_name, _anon_enum_fields = _last_anon_enum
+    if _anon_enum_name and name in _anon_enum_fields:
+        _put(f_out, indent_level,
+             'cdef enum:  # was anonymous enum: ', _anon_enum_name)
+        _put(f_out, indent_level + 1, name, ' = ', _anon_enum_name, '.', name)
+        return True
+
+    const_args = _format_constant(f_out, indent_level, value)
+    if not const_args:
+        return const_args
+
+    _put(f_out, indent_level, 'cdef enum:  # was a constant')
+    _put(f_out, indent_level + 1, name, ' = (', *const_args, ')')
+    return True
+
+
+def _format_rhs_ConstantExpressionNode(f_out, indent_level, definition):
+    value = definition.get('value')
+    if value is not None:
+        return value,
+
+
+def _format_rhs_BinaryExpressionNode(f_out, indent_level, definition):
+    name = definition.get('name')
+    if not name:
+        _logger.error('Unknown BinaryExpressionNode name=%r', name)
+        return False
+
+    left = definition.get('left')
+    right = definition.get('right')
+    if not all(isinstance(i, dict) for i in (left, right)):
+        _logger.error('Unknown BinaryExpressionNode type(left)=%r '
+                      'type(right)=%r', type(left), type(right))
+        return False
+
+    left_args = _format_rhs(f_out, indent_level, left)
+    if not left_args:
+        return left_args
+
+    right_args = _format_rhs(f_out, indent_level, right)
+    if not right_args:
+        return right_args
+
+    op = _BinaryExpressionNode_Ops.get(name)
+    if op:
+        return ('((', *left_args, ') ', op, ' (', *right_args, '))')
+
+    _warn(f_out, indent_level,
+          'Unsupported BinaryExpressionNode name=%r', name)
+    return False
+
+
+def _format_rhs_UnaryExpressionNode(f_out, indent_level, definition):
+    name = definition.get('name')
+    child = definition.get('child')
+    if not name or not isinstance(child, dict):
+        _logger.error('Unknown UnaryExpressionNode name=%r type(child)=%r',
+                      name, type(child))
+        return False
+
+    child_args = _format_rhs(f_out, indent_level, child)
+    if not child_args:
+        return child_args
+
+    op = _UnaryExpressionNode_Ops.get(name)
+    if op:
+        return ('(', op, ' (', *child_args, '))')
+
+    _warn(f_out, indent_level,
+          'Unsupported UnaryExpressionNode name=%r', name)
+    return False
+
+
+def _format_rhs_IdentifierExpressionNode(f_out, indent_level, definition):
+    name = definition.get('name')
+    if not name:
+        _logger.error('Unknown IdentifierExpressionNode name=%r', name)
+        return False
+
+    return name,
+
+
+def _format_rhs_ConditionalExpressionNode(f_out, indent_level, definition):
+    cond = definition.get('cond')
+    no = definition.get('no')
+    yes = definition.get('yes')
+    if any(not isinstance(i, dict) for i in (cond, no, yes)):
+        _logger.error('Unknown ConditionalExpressionNode type(cond)=%r '
+                      'type(no)=%r type(yes)=%r',
+                      type(cond), type(no), type(yes))
+        return False
+
+    cond_args = _format_rhs(f_out, indent_level, cond)
+    if not cond_args:
+        return cond_args
+
+    no_args = _format_rhs(f_out, indent_level, no)
+    if not no_args:
+        return no_args
+
+    yes_args = _format_rhs(f_out, indent_level, yes)
+    if not yes_args:
+        return yes_args
+
+    return ('((', *yes_args, ') if (',
+            *cond_args, ') else (', *no_args, '))')
+
+
+def _format_rhs_TypeCastExpressionNode(f_out, indent_level, definition):
+    ctype = definition.get('ctype')
+    base = definition.get('base')
+    if any(not isinstance(i, dict) for i in (ctype, base)):
+        _logger.error('Unknown TypeCastExpressionNode type(ctype)=%r '
+                      'type(base)=%r', type(ctype), type(base))
+        return False
+
+    type_args = _convert_base_Klass(f_out, indent_level, ctype)
+    if not type_args:
+        return type_args
+
+    base_args = _format_rhs(f_out, indent_level, base)
+    if not base_args:
+        return base_args
+
+    return ('(<', *type_args, '> (', *base_args, '))')
+
+
+_FORMAT_RHS_FUNS = {
+    'ConstantExpressionNode': _format_rhs_ConstantExpressionNode,
+    'BinaryExpressionNode': _format_rhs_BinaryExpressionNode,
+    'UnaryExpressionNode': _format_rhs_UnaryExpressionNode,
+    'IdentifierExpressionNode': _format_rhs_IdentifierExpressionNode,
+    'ConditionalExpressionNode': _format_rhs_ConditionalExpressionNode,
+    'TypeCastExpressionNode': _format_rhs_TypeCastExpressionNode,
+}
+
+
+def _format_rhs(f_out, indent_level, definition):
+    klass = definition.get('Klass')
+    if not klass:
+        _logger.error('Unknown rhs Klass=%r', klass)
+        return False
+
+    convert_fun = _FORMAT_RHS_FUNS.get(klass)
+    if convert_fun:
+        return convert_fun(f_out, indent_level, definition)
+
+    _warn(f_out, indent_level, 'Unsupported rhs Klass=%r', klass)
+    return False
+
+
+def _convert_enum(f_out, indent_level, definition):
+    global _last_anon_enum
+
+    name = definition.get('name')
+    fields = definition.get('fields')
+    if not name or not isinstance(fields, (list, NoneType)):
+        _logger.error('Unknown enum name=%r type(fields)=%r',
+                      name, type(fields))
+        return False
+
+    if name.startswith('anon_'):
+        _last_anon_enum = name, {field.get('name') for field in fields}
+
+    printed = None
+    if fields:
+        for field in fields:
+            field_name = field.get('name')
+            if not field_name:
+                _logger.error('Unknown enum field name=%r', field_name)
+                continue
+
+            ctype = field.get('ctype')
+            if not isinstance(ctype, dict):
+                _logger.error('Unknown enum field ctype=%r', ctype)
+                continue
+
+            value_args = _format_rhs(f_out, indent_level, ctype)
+            if not value_args:
+                continue
+
+            if not printed:
+                _put(f_out, indent_level, 'cdef enum ', name or '', ':')
+                printed = True
+
+            _put(f_out, indent_level + 1, field_name, ' = (', *value_args, ')')
+
+    return printed
+
+
+def _format_function(f_out, indent_level, definition):
+    _absent = object()
+
+    variadic = definition.get('variadic')
+
+    returns = definition.get('return', _absent)
+    if returns is _absent:
+        returns = definition.get('restype')
+
+    args = definition.get('args', _absent)
+    if args is _absent:
+        args = definition.get('argtypes')
+
+    if not isinstance(returns, (dict, NoneType)):
+        _logger.error('Unknown fuction type(return)=%r', type(returns))
+        return False
+    elif not isinstance(args, (list, NoneType)):
+        _logger.error('Unknown fuction type(args)=%r', type(returns))
+        return False
+
+    if returns:
+        returns_args = _convert_base_Klass(f_out, indent_level, returns)
+        if not returns_args:
+            return returns_args
+    else:
+        returns_args = 'void',
+
+    args_args = ()
+    if args:
+        for i in args:
+            i_args = _convert_base_Klass(f_out, indent_level, i)
+            if not i_args:
+                return i_args
+            elif args_args:
+                args_args = (*args_args, ', ', *i_args)
+            else:
+                args_args = i_args
+
+    if variadic:
+        if args_args:
+            args_args = (*args_args, ', ...')
+        else:
+            args_args = ('...',)
+
+    return returns_args, args_args
+
+
+def _convert_function(f_out, indent_level, definition):
+    name = definition.get('name')
+    if not name:
+        _logger.error('Unknown fuction name=%r', name)
+        return False
+
+    args = _format_function(f_out, indent_level, definition)
+    if not args:
+        return args
+
+    returns_args, args_args = args
+
+    _put(f_out, indent_level,
+         'cdef ', *returns_args, ' ', name, '(', *args_args, ')')
+    return True
+
+
+def _format_constant(f_out, indent_level, value):
+    m = _match_int(value)
+    if m:
+        capturesdict = m.capturesdict()
+        minus = capturesdict.get('minus')
+        prefix = capturesdict.get('prefix')
+        digits, = capturesdict.get('digits')
+
+        if minus:
+            minus, = minus
+        if prefix:
+            prefix, = prefix
+
+        result = int(digits, (10 if not prefix else
+                              16 if prefix == '0x' else 8))
+
+        if minus:
+            result = -result
+        return result,
+
+    m = _match_identifier(value)
+    if m:
+        result, = m.capturesdict().get('value')
+        return result,
+
+    m = _match_repr_str(value)
+    if m:
+        return value,
+
+    m = _match_verbatim(value)
+    if m:
+        _logger.info('Copying macro definition verbatim: %r', value)
+        return value,
+
+    _warn(f_out, indent_level,
+          'Constant expression not understood: %r', value)
+    return False
+
+
+def _convert_macro(f_out, indent_level, definition):
     name = definition.get('name')
     value = definition.get('value')
 
@@ -327,51 +525,16 @@ def _convert_macro(definition, f_out, indent_level):
         _logger.info('Macro omitted: %s', name)
         return False  # sic
 
-    elif isinstance(value, str):
-        result = None
-        for _ in (1,):
-            m = _match_int(value)
-            if m:
-                capturesdict = m.capturesdict()
-                minus = capturesdict.get('minus')
-                prefix = capturesdict.get('prefix')
-                digits, = capturesdict.get('digits')
+    const_args = _format_constant(f_out, indent_level, value)
+    if not const_args:
+        return const_args
 
-                if minus:
-                    minus, = minus
-                if prefix:
-                    prefix, = prefix
-
-                result = int(digits, (10 if not prefix else
-                                      16 if prefix == '0x' else 8))
-
-                if minus:
-                    result = -result
-                break
-
-            m = _match_identifier(value)
-            if m:
-                result, = m.capturesdict().get('value')
-                break
-
-            m = _match_verbatim(value)
-            if m:
-                _logger.info('Copying macro definition for %r verbatim', name)
-                result = value
-                break
-
-        if result is not None:
-            _put(f_out, indent_level, 'cdef enum:  # was a macro: %r' % value)
-            _put(f_out, indent_level + 1, name, ' = (', result, ')')
-            return True
-
-    _logger.warn('Macro omitted: %s', name)
-    _put(f_out, indent_level, ('# Macro omitted, not understood: %s = %r' %
-                               (name, value)))
+    _put(f_out, indent_level, 'cdef enum:  # was a macro: %r' % value)
+    _put(f_out, indent_level + 1, name, ' = (', *const_args, ')')
     return True
 
 
-def _convert_struct(definition, f_out, indent_level, struct='struct'):
+def _convert_struct(f_out, indent_level, definition, struct='struct'):
     name = definition.get('name')
     fields = definition.get('fields')
     if not name or not isinstance(fields, (list, NoneType)):
@@ -389,28 +552,40 @@ def _convert_struct(definition, f_out, indent_level, struct='struct'):
     else:
         _put(f_out, indent_level, 'cdef ', struct, ' ', *name_args, ':')
         for field in fields:
-            _convert_typedef(field, f_out, indent_level + 1,
+            _convert_typedef(f_out, indent_level + 1, field,
                              include_cdef=False)
 
     return True
 
 
-def _convert_union(definition, f_out, indent_level):
-    return _convert_struct(definition, f_out, indent_level, struct='union')
+def _convert_union(f_out, indent_level, definition):
+    return _convert_struct(f_out, indent_level, definition, struct='union')
 
 
-def _convert_typedef_CtypesSimple(name, ctype, include_cdef):
-    args = _format_CtypesSimple(ctype)
+def _convert_typedef_CtypesSimple(f_out, indent_level,
+                                  name, ctype, include_cdef):
+    args = _format_CtypesSimple(f_out, indent_level, ctype)
     if not args:
         return args
 
     return (
         'ctypedef ' if include_cdef else '',
-        *args, ' ', name,
+        *args, ' ', name or '',
     )
 
 
-def _convert_typedef_CtypesStruct(name, ctype, include_cdef):
+def _convert_typedef_CtypesEnum(f_out, indent_level,
+                                name, ctype, include_cdef):
+    tag = ctype.get('tag')
+    if not tag:
+        _logger.error('Unknown CtypesStruct tag=%r', tag)
+        return False
+
+    return ('ctypedef ' if include_cdef else '', tag, ' ', name or '')
+
+
+def _convert_typedef_CtypesStruct(f_out, indent_level,
+                                  name, ctype, include_cdef):
     variety = ctype.get('variety')
     if variety not in ('struct', 'union'):
         _logger.error('Unknown CtypesStruct variety=%r', variety)
@@ -428,14 +603,14 @@ def _convert_typedef_CtypesStruct(name, ctype, include_cdef):
     if name_args == _anon_struct_name(variety, name):
         return False  # sic
 
-    return ('ctypedef ' if include_cdef else '', *name_args, ' ', name)
+    return ('ctypedef ' if include_cdef else '', *name_args, ' ', name or '')
 
 
-def _convert_base_CtypesSimple(base):
-    return _format_CtypesSimple(base)
+def _convert_base_CtypesSimple(f_out, indent_level, base):
+    return _format_CtypesSimple(f_out, indent_level, base)
 
 
-def _convert_base_CtypesStruct(base):
+def _convert_base_CtypesStruct(f_out, indent_level, base):
     tag = base.get('tag')
     variety = base.get('variety')
     if not tag or not variety:
@@ -446,21 +621,21 @@ def _convert_base_CtypesStruct(base):
     return _anon_struct_name(variety, tag)
 
 
-def _convert_base_CtypesPointer(base):
+def _convert_base_CtypesPointer(f_out, indent_level, base):
     destination = base.get('destination')
     if not isinstance(destination, dict):
         _logger.error('Unsupported base Klass type(destination)=%r',
-                     destination)
+                      destination)
         return False
 
-    args = _convert_base_Klass(destination)
+    args = _convert_base_Klass(f_out, indent_level, destination)
     if not args:
         return args
 
     return (*args, '*')
 
 
-def _convert_base_CtypesTypedef(base):
+def _convert_base_CtypesTypedef(f_out, indent_level, base):
     name = base.get('name')
     if not name:
         _logger.error('Unsupported base Klass CtypesTypedef name=%r', name)
@@ -469,8 +644,8 @@ def _convert_base_CtypesTypedef(base):
     return (name or identifier,)
 
 
-def _convert_base_CtypesFunction(base):
-    args = _format_function(base)
+def _convert_base_CtypesFunction(f_out, indent_level, base):
+    args = _format_function(f_out, indent_level, base)
     if not args:
         return args
 
@@ -479,8 +654,8 @@ def _convert_base_CtypesFunction(base):
     return (*returns_args, '(', *args_args, ')')
 
 
-def _convert_base_CtypesArray(base):
-    args = _format_CtypesArray(base)
+def _convert_base_CtypesArray(f_out, indent_level, base):
+    args = _format_CtypesArray(f_out, indent_level, base)
     if not args:
         return args
 
@@ -488,7 +663,7 @@ def _convert_base_CtypesArray(base):
     return (*base_args, '[', *count_args, ']')
 
 
-def _convert_base_CtypesSpecial(base):
+def _convert_base_CtypesSpecial(f_out, indent_level, base):
     name = base.get('name')
     if not name:
         _logger.error('Unsupported base Klass CtypesSpecial name=%r', name)
@@ -496,32 +671,21 @@ def _convert_base_CtypesSpecial(base):
     if name == 'String':
         return 'char*',
 
-    _logger.warn('Unknown CtypesSpecial name=%r', name)
+    _warn(f_out, indent_level, 'Unknown CtypesSpecial name=%r', name)
     return False
 
 
-_CONVERT_BASE_FUNS = {
-    'CtypesArray': _convert_base_CtypesArray,
-    'CtypesFunction': _convert_base_CtypesFunction,
-    'CtypesPointer': _convert_base_CtypesPointer,
-    'CtypesSimple': _convert_base_CtypesSimple,
-    'CtypesSpecial': _convert_base_CtypesSpecial,
-    'CtypesStruct': _convert_base_CtypesStruct,
-    'CtypesTypedef': _convert_base_CtypesTypedef,
-}
-
-
-def _convert_base_Klass(base):
+def _convert_base_Klass(f_out, indent_level, base):
     klass = base.get('Klass')
     convert_fun = _CONVERT_BASE_FUNS.get(klass)
     if convert_fun:
-        return convert_fun(base)
+        return convert_fun(f_out, indent_level, base)
     else:
-        _logger.warn('Unsupported base Klass=%r', klass)
+        _warn(f_out, indent_level, 'Unsupported base Klass=%r', klass)
         return False
 
 
-def _format_CtypesArray(ctype):
+def _format_CtypesArray(f_out, indent_level, ctype):
     base = ctype.get('base')
     if not isinstance(base, dict):
         _logger.error('CtypesArray type(base)=%r', type(base))
@@ -533,96 +697,109 @@ def _format_CtypesArray(ctype):
         return False
 
     if count is not None:
-        count_args = _format_rhs(count)
+        count_args = _format_rhs(f_out, indent_level, count)
         if not count_args:
             return count_args
     else:
         count_args = ()
 
-    base_args = _convert_base_Klass(base)
+    base_args = _convert_base_Klass(f_out, indent_level, base)
     if not base_args:
         return base_args
 
     return base_args, count_args
 
 
-def _convert_typedef_CtypesArray(name, ctype, include_cdef):
-    args = _format_CtypesArray(ctype)
+def _convert_typedef_CtypesArray(f_out, indent_level,
+                                 name, ctype, include_cdef):
+    args = _format_CtypesArray(f_out, indent_level, ctype)
     if not args:
         return args
 
-    base_args, count_args = _format_CtypesArray(ctype)
+    base_args, count_args = args
     return (
         'ctypedef ' if include_cdef else '',
         *base_args, ' ', name or '', '[', *count_args, ']',
     )
 
 
-def _convert_typedef_CtypesPointer(name, ctype, include_cdef):
+def _convert_typedef_CtypesSpecial(f_out, indent_level,
+                                   name, ctype, include_cdef):
+    special_name = ctype.get('name')
+    if not special_name:
+        _logger.error('Unknown CtypesSpecial name=%r', special_name)
+        return False
+
+    if special_name == 'String':
+        return (
+            'ctypedef ' if include_cdef else '',
+            'char* ', name or '',
+        )
+
+    _warn(f_out, indent_level,
+          'Unsupported CtypesSpecial name=%r', special_name)
+    return False
+
+
+def _convert_typedef_CtypesPointer(f_out, indent_level,
+                                   name, ctype, include_cdef):
     destination = ctype.get('destination')
     if not isinstance(destination, dict):
         _logger.error('Unsupported base Klass type(destination)=%r',
                       destination)
         return False
 
-    args = _convert_base_Klass(destination)
+    args = _convert_base_Klass(f_out, indent_level, destination)
     if not args:
         return args
 
     return (
-        'cdef ' if include_cdef else '',
-        *args, '* ', name,
+        'ctypedef ' if include_cdef else '',
+        *args, '* ', name or '',
     )
 
 
-def _convert_typedef_CtypesFunction(name, ctype, include_cdef):
-    args = _format_function(ctype)
+def _convert_typedef_CtypesFunction(f_out, indent_level,
+                                    name, ctype, include_cdef):
+    args = _format_function(f_out, indent_level, ctype)
     if not args:
         return args
 
     returns_args, args_args = args
-
     return (
         'ctypedef ' if include_cdef else '',
-        *returns_args, ' ', name, '(', *args_args, ')',
+        *returns_args, ' ', name or '', '(', *args_args, ')',
     )
 
 
-def _convert_typedef_CtypesTypedef(name, ctype, include_cdef):
+def _convert_typedef_CtypesTypedef(f_out, indent_level,
+                                   name, ctype, include_cdef):
     base_name = ctype.get('name')
     if not base_name:
         _logger.error('Unknown CtypesTypedef name=%r', base_name)
         return False
 
     return (
-        'cdef ' if include_cdef else '',
-        base_name, ' ', name,
+        'ctypedef ' if include_cdef else '',
+        base_name, ' ', name or '',
     )
 
 
-_CONVERT_TYPEDEF_FUNS = {
-    'CtypesArray': _convert_typedef_CtypesArray,
-    'CtypesFunction': _convert_typedef_CtypesFunction,
-    'CtypesPointer': _convert_typedef_CtypesPointer,
-    'CtypesSimple': _convert_typedef_CtypesSimple,
-    'CtypesStruct': _convert_typedef_CtypesStruct,
-    'CtypesTypedef': _convert_typedef_CtypesTypedef,
-}
-
-
-def _convert_typedef(definition, f_out, indent_level, include_cdef=True):
+def _convert_typedef(f_out, indent_level, definition, include_cdef=True):
     name = definition.get('name')
+    if not name and include_cdef:
+        _logger.error('Unknown typedef data name=%r', name)
+        return False
+
     ctype = definition.get('ctype')
-    if not name or not isinstance(ctype, dict):
-        _logger.error('Unknown typedef data name=%r type(ctype)=%r',
-                      name, type(ctype))
+    if not isinstance(ctype, dict):
+        _logger.error('Unknown typedef data type(ctype)=%r', type(ctype))
         return False
 
     klass = ctype.get('Klass')
-
     convert_fun = _CONVERT_TYPEDEF_FUNS.get(klass)
     if convert_fun:
-        args = convert_fun(name, ctype, include_cdef)
+        args = convert_fun(f_out, indent_level, name, ctype, include_cdef)
         if not args:
             return args
 
@@ -630,10 +807,11 @@ def _convert_typedef(definition, f_out, indent_level, include_cdef=True):
         return True
 
     else:
-        _logger.warn('Unknown typedef Klass=%r', klass)
+        _warn(f_out, indent_level, 'Unknown typedef Klass=%r', klass)
 
 
-def _convert_macro_function(definition, f_out, indent_level, include_cdef=True):
+def _convert_macro_function(f_out, indent_level, definition,
+                            include_cdef=True):
     name = definition.get('name')
     args = definition.get('args') or ()
     body = definition.get('body') or ''
@@ -641,29 +819,33 @@ def _convert_macro_function(definition, f_out, indent_level, include_cdef=True):
         _logger.error('Unknown macro function name=%r', name)
         return False
 
-    _logger.warn('Cannot convert macro function %s', name)
-    _put(f_out, indent_level, ('# Unconvertable macro function: %s(%s) %r' %
-                               (name, ', '.join(args), body)))
+    _warn(f_out, indent_level,
+          'Unconvertable macro function: %s(%s) %r',
+          name, ', '.join(args), body)
     return True
-
-
-_CONVERT_FUNS = {
-    'constant': _convert_constant,
-    'enum': _convert_enum,
-    'function': _convert_function,
-    'macro': _convert_macro,
-    'macro_function': _convert_macro_function,
-    'struct': _convert_struct,
-    'typedef': _convert_typedef,
-    'union': _convert_union,
-}
 
 
 def _put(f_out, indent_level, *args, **kw):
     print('    ' * indent_level, *args, file=f_out, sep='')
 
 
-def convert(definitions, f_out, import_from='*', indent_level=0):
+def _warn(f_out, indent_level, warn_format, *args):
+    caller = getframeinfo(stack()[1][0])
+
+    buf = StringIO()
+    print('[%s:%d]' % (caller.function, caller.lineno),
+          warn_format % args, file=buf, end='')
+    buf.seek(0)
+
+    msg = buf.read()
+    _logger.warn(msg)
+    _put(f_out, indent_level, '# ', msg)
+
+
+def convert(definitions, f_out, *,
+            import_from='*', indent_level=0, def_extras=()):
+    global _last_anon_enum
+
     unknown_types = set()
 
     for h_name, items in (('stddef', _STDDEF_TYPES),
@@ -672,10 +854,12 @@ def convert(definitions, f_out, import_from='*', indent_level=0):
         for line in wrap(', '.join(items), 79 - 4 * (indent_level + 1)):
             _put(f_out, indent_level + 1, line)
         _put(f_out, indent_level, ')')
-        _put(f_out, indent_level)
+
+    _put(f_out, indent_level)
+    _put(f_out, indent_level)
 
     _put(f_out, indent_level,
-         'cdef extern from ', import_from or '*', ' nogil:')
+         'cdef extern from ', import_from or '*', *def_extras, ':')
 
     for definition in definitions:
         if not isinstance(definition, dict):
@@ -683,26 +867,24 @@ def convert(definitions, f_out, import_from='*', indent_level=0):
 
         typ = definition.get('type')
         if not typ:
+            _logger.error('Unknown type=%r', typ)
             continue
+
+        if typ != 'constant':
+            _last_anon_enum = None, None
 
         convert_fun = _CONVERT_FUNS.get(typ)
         if convert_fun:
-            if convert_fun(definition, f_out, indent_level + 1):
+            if convert_fun(f_out, indent_level + 1, definition):
                 _put(f_out, 0)
+
         elif typ not in unknown_types:
             unknown_types.add(typ)
-            _logger.warn('Unknown type=%r', typ)
+            _warn(f_out, indent_level, 'Unknown type=%r', typ)
 
 
-def main(argv=argv, stdin=stdin, stdout=stdout):
-    basicConfig(
-        level=WARN,
-        format='[%(levelname)s] [%(funcName)s:%(lineno)d] %(message)s',
-    )
-
-    automatic_import_from = object()
-
-    parser = ArgumentParser(prog=argv[0],
+def gen_argv_parser(prog):
+    parser = ArgumentParser(prog=prog,
                             description='Convert C header to Cython .pxd file')
     parser.add_argument('input',
                         nargs='?',
@@ -722,7 +904,6 @@ def main(argv=argv, stdin=stdin, stdout=stdout):
                              'supplied or the input file is STDIN, then '
                              '"*" is used.')
     parser.add_argument('-t', '--type',
-                        nargs=1,
                         choices=('auto', 'json', 'h'),
                         default='auto',
                         dest='input_type',
@@ -751,7 +932,34 @@ def main(argv=argv, stdin=stdin, stdout=stdout):
                         type=float,
                         dest='ctypesgen_timeout',
                         help='Maximum runtime for ctypesgen.py, default=30.')
+    parser.add_argument('--gil',
+                        action='store_const',
+                        default=' nogil',
+                        const='',
+                        dest='use_gil',
+                        help='Don\'t release global interpreter lock.')
+    parser.add_argument('--indent_level',
+                        nargs=1,
+                        type=int,
+                        default=0,
+                        dest='indent_level',
+                        help='Starting indentation level, default=0.')
+    parser.add_argument('-q', '--quiet',
+                        action='store_const',
+                        default=False,
+                        const=True,
+                        dest='quiet_ctypesgen',
+                        help='Suppress ctypesgen warnings.')
+    return parser
 
+
+def main(argv=argv, stdin=stdin, stdout=stdout):
+    basicConfig(
+        level=WARN,
+        format='[%(levelname)s] %(message)s',
+    )
+
+    parser = gen_argv_parser(argv[0])
     args = parser.parse_args(argv[1:])
 
     if not args.input or args.input == '-':
@@ -796,17 +1004,19 @@ def main(argv=argv, stdin=stdin, stdout=stdout):
                 ['ctypesgen.py',
                  *args.ctypesgen_args,
                  '--output-language=json',
-                 '/dev/stdin'
-                ],
+                 '/dev/stdin'],
                 stdin=PIPE,
                 stdout=PIPE,
+                stderr=PIPE if args.quiet_ctypesgen else stderr,
                 universal_newlines=isinstance(input_data, str),
             )
-            input_data, _ = ctypesgen_process.communicate(
+            input_data, error_log = ctypesgen_process.communicate(
                 input=input_data,
                 timeout=args.ctypesgen_timeout,
             )
             if ctypesgen_process.returncode != 0:
+                if args.quiet_ctypesgen:
+                    stderr.write(error_log)
                 raise Exception('ctypesgen.py returned an error: %r',
                                 ctypesgen_process.returncode)
         finally:
@@ -820,7 +1030,43 @@ def main(argv=argv, stdin=stdin, stdout=stdout):
 
     with (open(args.output, args.write_mode)
           if args.output else stdout) as f_out:
-        convert(definitions, f_out, args.import_from)
+        convert(definitions, f_out,
+                import_from=args.import_from,
+                indent_level=args.indent_level,
+                def_extras=(args.use_gil,))
+
+
+_CONVERT_BASE_FUNS = {
+    'CtypesArray': _convert_base_CtypesArray,
+    'CtypesFunction': _convert_base_CtypesFunction,
+    'CtypesPointer': _convert_base_CtypesPointer,
+    'CtypesSimple': _convert_base_CtypesSimple,
+    'CtypesSpecial': _convert_base_CtypesSpecial,
+    'CtypesStruct': _convert_base_CtypesStruct,
+    'CtypesTypedef': _convert_base_CtypesTypedef,
+}
+
+_CONVERT_TYPEDEF_FUNS = {
+    'CtypesArray': _convert_typedef_CtypesArray,
+    'CtypesEnum': _convert_typedef_CtypesEnum,
+    'CtypesFunction': _convert_typedef_CtypesFunction,
+    'CtypesPointer': _convert_typedef_CtypesPointer,
+    'CtypesSimple': _convert_typedef_CtypesSimple,
+    'CtypesStruct': _convert_typedef_CtypesStruct,
+    'CtypesTypedef': _convert_typedef_CtypesTypedef,
+    'CtypesSpecial': _convert_typedef_CtypesSpecial,
+}
+
+_CONVERT_FUNS = {
+    'constant': _convert_constant,
+    'enum': _convert_enum,
+    'function': _convert_function,
+    'macro': _convert_macro,
+    'macro_function': _convert_macro_function,
+    'struct': _convert_struct,
+    'typedef': _convert_typedef,
+    'union': _convert_union,
+}
 
 
 if __name__ == '__main__':
