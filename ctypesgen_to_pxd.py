@@ -25,7 +25,6 @@ from io import StringIO
 from json import loads
 from logging import getLogger, basicConfig, WARN, ERROR
 from os.path import basename, splitext
-from regex import compile as compile_re, VERBOSE, VERSION1
 from subprocess import Popen, PIPE, TimeoutExpired
 from sys import stdin, stdout, stderr, argv
 from textwrap import wrap
@@ -50,15 +49,6 @@ NoneType = type(None)
 automatic_import_from = object()
 
 
-def _anon_struct_name(variety, tag):
-    return tag
-
-
-def _anon_array_name(definition):
-    hashsum = md5(definition.encode('UTF-8')).digest()
-    return '_arr' + b32encode(hashsum).rstrip(b'=').decode('ASCII')
-
-
 def _stdint_gen():
     for prefix in ('', 'u'):
         for infix in ('', '_least', '_fast'):
@@ -75,104 +65,6 @@ _STDINT_TYPES = sorted(_stdint_gen())
 _SIMPLE_TYPES = frozenset('''
     int char short void size_t ssize_t float double _Bool
 '''.split()) | set(_STDDEF_TYPES + _STDINT_TYPES)
-
-_match_verbatim = compile_re(r'''
-    # unary plus / minus
-    (?>
-        [+~-\s]+ |
-        sizeof (?=\W)
-    )*+
-
-    (?>
-        # match integer
-        (?: 0x)?+
-        \d++
-        [uU]? [lL]{0,2}
-    |
-        # match float
-        \d++ (?> [.] \d++)? (?> [eE] [+-]?+ \d++)?+
-    |
-        # match identifier
-        [_a-zA-Z] [_a-zA-Z0-9]*+
-    |
-        # match string
-        ["]
-        (?>
-            [^"\\\r\n]++ |
-            [\\] (?>
-                [abefnrtv\\'"?] |
-                [1-2][0-7]{0,2} |
-                [3-7][0-7]? |
-                x[0-9a-fA-F]{2}
-            )
-        )*+
-        ["]
-    |
-        # match parens
-        \( (?R) \)
-    )
-
-    \s*+
-
-    (?>
-        # match calculation
-        (?> [+*/%&^|-] | << | >>)
-        (?R)
-    )?+
-''', VERBOSE | VERSION1).fullmatch
-
-_match_repr_str = compile_re(r'''
-    (['"])
-    (?>
-        (?! \1)
-        (?>
-            [^\\\r\n] |  # cannot add ++ because the (?!\1) is needed
-            [\\] (?>
-                [0abefnrtv\\'"?] |
-                [1-2][0-7]{0,2} |
-                [3-7][0-7]? |
-                x[0-9a-fA-F]{2} |
-                u[0-9a-fA-F]{4} |
-                U[0-9a-fA-F]{8}
-            )
-        )
-    )*+
-    \1
-''', VERBOSE | VERSION1).fullmatch
-
-_match_int = compile_re(r'''
-    \s*+
-    (?>
-        \( (?R) \)
-    |
-        (?>
-            (?>
-                (?> (?P<minus> -) | [+] )
-                \s*+
-            )?
-            (?P<inner>
-                \( \s*+ (?&inner) \s*+ \)
-            |
-                (?>
-                    (?P<prefix> 0x?)?
-                    (?P<digits> \d+)
-                    (?> [uU]? [lL]{0,2})
-                )
-            )
-        )
-    )
-    \s*+
-''', VERBOSE | VERSION1).fullmatch
-
-_match_identifier = compile_re(r'''
-    \s*+
-    (?>
-        \( (?R) \)
-    |
-        (?P<value> [_a-zA-Z] [_a-zA-Z0-9]*+ )
-    )
-    \s*+
-''', VERBOSE | VERSION1).fullmatch
 
 _BinaryExpressionNode_Ops = {
     'addition': '+',
@@ -223,12 +115,7 @@ def _convert_constant(f_out, indent_level, definition):
         return True
 
     _put(f_out, indent_level, 'cdef enum:  # was a constant: ', repr(value))
-
-    const_args = _format_constant(f_out, indent_level, value)
-    if const_args:
-        _put(f_out, indent_level + 1, name, ' = (', *const_args, ')')
-    else:
-        _put(f_out, indent_level + 1, name, '  # value could not be parsed')
+    _put(f_out, indent_level + 1, name)
     return True
 
 
@@ -485,45 +372,6 @@ def _convert_function(f_out, indent_level, definition):
     return True
 
 
-def _format_constant(f_out, indent_level, value):
-    m = _match_int(value)
-    if m:
-        capturesdict = m.capturesdict()
-        minus = capturesdict.get('minus')
-        prefix = capturesdict.get('prefix')
-        digits, = capturesdict.get('digits')
-
-        if minus:
-            minus, = minus
-        if prefix:
-            prefix, = prefix
-
-        result = int(digits, (10 if not prefix else
-                              16 if prefix == '0x' else 8))
-
-        if minus:
-            result = -result
-        return result,
-
-    m = _match_identifier(value)
-    if m:
-        result, = m.capturesdict().get('value')
-        return result,
-
-    m = _match_repr_str(value)
-    if m:
-        return value,
-
-    m = _match_verbatim(value)
-    if m:
-        _logger.info('Copying macro definition verbatim: %r', value)
-        return value,
-
-    _warn(f_out, indent_level,
-          'Constant expression not understood: %r', value)
-    return False
-
-
 def _convert_macro(f_out, indent_level, definition):
     name = definition.get('name')
     value = definition.get('value')
@@ -533,12 +381,7 @@ def _convert_macro(f_out, indent_level, definition):
         return False  # sic
 
     _put(f_out, indent_level, 'cdef enum:  # was a macro: %r' % value)
-
-    const_args = _format_constant(f_out, indent_level, value)
-    if const_args:
-        _put(f_out, indent_level + 1, name, ' = (', *const_args, ')')
-    else:
-        _put(f_out, indent_level + 1, name, '  # value could not be parsed')
+    _put(f_out, indent_level + 1, name)
     return True
 
 
@@ -569,9 +412,7 @@ def _convert_struct(f_out, indent_level, definition, struct='struct'):
                       struct, name, type(fields))
         return False
 
-    name_args = _anon_struct_name(struct, name)
-    if not name_args:
-        return name_args
+    name_args = name,
 
     if fields is None:
         _put(f_out, indent_level,
@@ -605,13 +446,9 @@ def _convert_struct(f_out, indent_level, definition, struct='struct'):
                 return array_args
             base_args, count_args = array_args
 
-            actual_def = ('__typeof__(', *base_args, '[', *count_args, '])')
-            actual_def = repr(''.join(map(str, actual_def)))
-            anon = _anon_array_name(actual_def)
-            _put(f_out, indent_level, 'ctypedef ', *base_args, '[1] ',
-                 anon, ' ', actual_def)
-
-            field_args = anon, ' ', name
+            _put(f_out, indent_level,
+                 '# ', *base_args, ' ', name, '[', *count_args, ']')
+            field_args = (*base_args, ' ', name, '[1]')
 
         fields_args.append(field_args)
 
@@ -681,14 +518,10 @@ def _convert_typedef_CtypesStruct(f_out, indent_level,
         _logger.error('Unknown CtypesStruct tag=%r', tag)
         return False
 
-    name_args = _anon_struct_name(variety, tag)
-    if not name_args:
-        return name_args
-
-    if name_args == _anon_struct_name(variety, name):
+    if tag == name:
         return False  # sic
 
-    return ('ctypedef ' if include_cdef else '', *name_args, ' ', name or '')
+    return ('ctypedef ' if include_cdef else '', tag, ' ', name or '')
 
 
 def _convert_base_CtypesSimple(f_out, indent_level, base):
@@ -703,7 +536,7 @@ def _convert_base_CtypesStruct(f_out, indent_level, base):
                       klass, tag, variety)
         return False
 
-    return _anon_struct_name(variety, tag)
+    return tag,
 
 
 def _convert_base_CtypesPointer(f_out, indent_level, base):
