@@ -738,8 +738,9 @@ def _convert_macro_function(f_out, indent_level, definition,
         return False
 
     _warn(f_out, indent_level,
-          'Unconvertable macro function: %s(%s) %r',
+          'Return type and arguments unknown for macro function: %s(%s) %r',
           name, ', '.join(args), body)
+    _put(f_out, indent_level, 'cdef void* ', name, '(...)')
     return True
 
 
