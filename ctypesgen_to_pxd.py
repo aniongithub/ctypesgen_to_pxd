@@ -16,12 +16,9 @@
 # limitations under the License.
 
 
-from argparse import ArgumentParser, FileType
-from base64 import b32encode
+from argparse import ArgumentParser
 from builtins import compile as compile_expr
-from hashlib import md5
 from inspect import stack, getframeinfo
-from io import StringIO
 from json import loads
 from logging import getLogger, basicConfig, WARN, ERROR
 from os.path import basename, splitext
@@ -367,8 +364,15 @@ def _convert_function(f_out, indent_level, definition):
 
     returns_args, args_args = args
 
-    _put(f_out, indent_level,
-         'cdef ', *returns_args, ' ', name, '(', *args_args, ')')
+    if returns_args == (name,):
+        _warn(f_out, indent_level, 'Function has the same name as its '
+                                   'return type: %r', name)
+        _put(f_out, indent_level,
+             'cdef extern ', *returns_args, ' ', name, '_function ',
+             repr(name), ' (', *args_args, ') ')
+    else:
+        _put(f_out, indent_level,
+             'cdef ', *returns_args, ' ', name, '(', *args_args, ')')
     return True
 
 
@@ -396,12 +400,56 @@ def _convert_variable(f_out, indent_level, definition):
         _logger.error('Unknown variable type(ctype)=%r', type(ctype))
         return False
 
-    type_args = _convert_base_Klass(f_out, indent_level, ctype)
-    if not type_args:
-        return type_args
+    klass = ctype.get('Klass')
+    if not isinstance(klass, str):
+        _logger.error('Unknown variable ctype.Klass=%r', klass)
+        return False
 
-    _put(f_out, indent_level, 'cdef extern ', *type_args, ' ', name)
-    return True
+    pointers = 0
+    while klass == 'CtypesPointer':
+        destination = ctype.get('destination')
+        if not isinstance(destination, dict):
+            _logger.error('Unknown CtypesPointer type(destination)=%r',
+                          type(destination))
+            return False
+
+        klass = destination.get('Klass')
+        ctype = destination
+        pointers += 1
+
+    if klass == 'CtypesArray':
+        args = _format_CtypesArray(f_out, indent_level, ctype)
+        if not args:
+            return args
+
+        base_args, count_args = args
+        _put(f_out, indent_level, 'cdef extern ', *base_args, ' ', name,
+             '[', *count_args, ']')
+        return True
+
+    elif klass == 'CtypesFunction':
+        args = _format_function(f_out, indent_level, ctype)
+        if not args:
+            return args
+
+        if pointers:
+            name = ('(', '*' * pointers, name, ')')
+        else:
+            name = name,
+
+        returns_args, args_args = args
+        _put(f_out, indent_level, 'cdef extern ', *returns_args, ' ', *name,
+             '(', *args_args, ')')
+        return True
+
+    else:
+        type_args = _convert_base_Klass(f_out, indent_level, ctype)
+        if not type_args:
+            return type_args
+
+        _put(f_out, indent_level, 'cdef extern ', *type_args, ' ',
+             '*' * pointers, name)
+        return True
 
 
 def _convert_struct(f_out, indent_level, definition, struct='struct'):
@@ -430,6 +478,26 @@ def _convert_struct(f_out, indent_level, definition, struct='struct'):
 
         klass = ctype.get('Klass')
         if klass != 'CtypesArray':
+            if klass == 'CtypesPointer':
+                destination = ctype.get('destination')
+                if not isinstance(destination, dict):
+                    _logger.error('Unknown CtypesPointer type(destination)=%r',
+                                  type(destination))
+                    return False
+
+                subklass = destination.get('Klass')
+                subname = destination.get('name')
+                if (subklass == 'CtypesTypedef') and \
+                   (subname in INCOMPLETE_STRUCT_TYPES):
+                    _warn(f_out, indent_level, 'Replacing "%s %s" by void',
+                          subname, name)
+                    destination.update({
+                        'Klass': 'CtypesSimple',
+                        'longs': 0,
+                        'name': 'void',
+                        'signed': True
+                    })
+
             convert_fun = _CONVERT_TYPEDEF_FUNS.get(klass)
             if not convert_fun:
                 _warn(f_out, indent_level, 'Unknown typedef Klass=%r', klass)
@@ -535,6 +603,10 @@ def _convert_base_CtypesStruct(f_out, indent_level, base):
         _logger.error('Unsupported base Klass=%r tag=%r variety=%r',
                       klass, tag, variety)
         return False
+
+    if tag in INCOMPLETE_STRUCT_TYPES:
+        _warn(f_out, indent_level, 'Replacing %r by void*', tag)
+        return 'void*',
 
     return tag,
 
@@ -750,14 +822,8 @@ def _put(f_out, indent_level, *args, **kw):
 
 def _warn(f_out, indent_level, warn_format, *args):
     caller = getframeinfo(stack()[1][0])
-
-    buf = StringIO()
-    print('[%s:%d]' % (caller.function, caller.lineno),
-          warn_format % args, file=buf, end='')
-    buf.seek(0)
-
-    msg = buf.read()
-    _logger.warn(msg)
+    msg = warn_format % args
+    _logger.warn('[%s:%d] %s', caller.function, caller.lineno, msg)
     _put(f_out, indent_level, '# ', msg)
 
 
@@ -1002,6 +1068,9 @@ _CONVERT_FUNS = {
     'union': _convert_union,
     'variable': _convert_variable,
 }
+
+# Work around malloc.h oddities
+INCOMPLETE_STRUCT_TYPES = {'_IO_lock_t', '_IO_FILE_plus'}
 
 
 if __name__ == '__main__':

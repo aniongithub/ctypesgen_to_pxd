@@ -93,6 +93,9 @@ _HEADERS = '''
     wchar
     wctype
     wordexp
+
+    alloca
+    malloc
 '''.split()
 
 
