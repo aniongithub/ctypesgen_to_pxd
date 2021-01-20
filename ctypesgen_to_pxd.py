@@ -569,8 +569,8 @@ def _convert_typedef_CtypesEnum(f_out, indent_level,
         _logger.error('Unknown CtypesStruct tag=%r', tag)
         return False
 
-    return ('ctypedef ' if include_cdef else '', tag, ' ', name or '')
-
+    if tag != name:
+        return ('ctypedef ' if include_cdef else '', tag, ' ', name or '')
 
 def _convert_typedef_CtypesBitfield(f_out, indent_level,
                                     name, ctype, include_cdef):
