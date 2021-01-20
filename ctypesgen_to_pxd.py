@@ -563,8 +563,6 @@ def _convert_typedef_CtypesEnum(f_out, indent_level,
                                 name, ctype, include_cdef):
     tag = ctype.get('tag')
 
-    print(f"_convert_typedef_CtypesEnum: {tag}")
-    
     if not tag:
         _logger.error('Unknown CtypesStruct tag=%r', tag)
         return False
