@@ -45,6 +45,15 @@ NoneType = type(None)
 
 automatic_import_from = object()
 
+# So we can output forward declared symbols
+forward_declared = set()
+
+# Expose this as global to allow convert functions to change 
+# the definitions currently being processed
+definitions = {}
+
+# Make this global so convert functions can use args too
+args = None
 
 def _stdint_gen():
     for prefix in ('', 'u'):
@@ -106,9 +115,9 @@ def _convert_constant(f_out, indent_level, definition):
 
     _anon_enum_name, _anon_enum_fields = _last_anon_enum
     if _anon_enum_name and name in _anon_enum_fields:
-        _put(f_out, indent_level,
-             'cdef enum:  # was anonymous enum: ', _anon_enum_name)
-        _put(f_out, indent_level + 1, name, ' = ', _anon_enum_name, '.', name)
+        # _put(f_out, indent_level,
+        #      'cdef enum:  # was anonymous enum: ', _anon_enum_name)
+        # _put(f_out, indent_level + 1, name, ' = ', _anon_enum_name, '.', name)
         return True
 
     _put(f_out, indent_level, 'cdef enum:  # was a constant: ', repr(value))
@@ -460,6 +469,13 @@ def _convert_struct(f_out, indent_level, definition, struct='struct'):
                       struct, name, type(fields))
         return False
 
+    global args
+    if (name in args.force_forwards) and (name not in forward_declared):
+        print(f"Forcing forward declaration for {name}")
+        fields = None
+        definitions.append(definition)
+        forward_declared.add(name)
+
     name_args = name,
 
     if fields is None:
@@ -546,6 +562,9 @@ def _convert_typedef_CtypesSimple(f_out, indent_level,
 def _convert_typedef_CtypesEnum(f_out, indent_level,
                                 name, ctype, include_cdef):
     tag = ctype.get('tag')
+
+    print(f"_convert_typedef_CtypesEnum: {tag}")
+    
     if not tag:
         _logger.error('Unknown CtypesStruct tag=%r', tag)
         return False
@@ -951,11 +970,16 @@ def gen_argv_parser(prog):
                         const=ERROR,
                         dest='log_level',
                         help='Don\'t show warnings.')
+    parser.add_argument('--force_forwards',
+        nargs="+", default = [])
+    
     return parser
 
 
 def main(argv=argv, stdin=stdin, stdout=stdout):
     parser = gen_argv_parser(argv[0])
+
+    global args
     args = parser.parse_args(argv[1:])
 
     basicConfig(level=args.log_level, format='[%(levelname)s] %(message)s')
@@ -1024,6 +1048,7 @@ def main(argv=argv, stdin=stdin, stdout=stdout):
     if isinstance(input_data, bytes):
         input_data = input_data.decode('UTF-8')
 
+    global definitions
     definitions = loads(input_data)
 
     with (open(args.output, args.write_mode)
