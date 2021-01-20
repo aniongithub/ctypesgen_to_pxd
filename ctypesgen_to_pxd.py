@@ -120,8 +120,8 @@ def _convert_constant(f_out, indent_level, definition):
         # _put(f_out, indent_level + 1, name, ' = ', _anon_enum_name, '.', name)
         return True
 
-    _put(f_out, indent_level, 'cdef enum:  # was a constant: ', repr(value))
-    _put(f_out, indent_level + 1, name)
+    # _put(f_out, indent_level, 'cdef enum:  # was a constant: ', repr(value))
+    # _put(f_out, indent_level + 1, name)
     return True
 
 
