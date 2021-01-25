@@ -775,7 +775,7 @@ def _convert_typedef_CtypesFunction(f_out, indent_level,
     returns_args, args_args = args
     return (
         'ctypedef ' if include_cdef else '',
-        *returns_args, ' ', name or '', '(', *args_args, ')',
+        *returns_args, ' (*', name or '', ')(', *args_args, ')',
     )
 
 
